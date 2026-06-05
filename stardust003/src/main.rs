@@ -1,31 +1,28 @@
-// =============================================================================
+ // =============================================================================
 // tools — Deterministic key generation + high-reliability streaming XOR
 // Single-file Linux CLI tool
 // =============================================================================
-
-// Force Linux-only compilation. renameat2 + RENAME_NOREPLACE and other
-// atomic file operations used here are Linux-specific.
+// Force Linux-only compilation.
+// We use Linux-specific syscalls (renameat2) for atomic file replacement.
 #[cfg(not(target_os = "linux"))]
 compile_error!(
-    "This tool only supports Linux. It uses Linux-specific atomic file operations \
-     (renameat2 with RENAME_NOREPLACE) that do not exist on Windows or macOS."
+    "This tool only supports Linux. It uses the Linux-specific renameat2 syscall \
+     for safe atomic file replacement."
 );
-
 use std::env;
 use std::ffi::CString;
-use std::fs::{File, metadata, remove_file, OpenOptions};
+use std::fs::{File, metadata, remove_file, OpenOptions, canonicalize};
 use std::io::{self, BufReader, BufWriter, Read, Write, ErrorKind};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process;
 use clap::{Parser, Subcommand};
-use libc::{self, AT_FDCWD, RENAME_NOREPLACE};
+use libc::{self, AT_FDCWD};
 use rpassword::prompt_password;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20::ChaCha20;
 use cipher::{KeyIvInit, StreamCipher};
 use sha2::{Digest, Sha256};
-
 // =============================================================================
 // Shared helper: always use key.key next to the executable
 // =============================================================================
@@ -35,16 +32,13 @@ fn default_key_path() -> std::path::PathBuf {
     path.push("key.key");
     path
 }
-
 // =============================================================================
 // KEYGEN
 // =============================================================================
 mod keygen {
     use super::*;
-
     pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
     pub const MAX_SIZE: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
-
     #[derive(Parser, Debug)]
     #[command(about = "Deterministic key generator: password → reproducible keystream. Always writes to 'key.key' next to the executable (silently overwrites if it exists).")]
     pub struct Args {
@@ -55,17 +49,14 @@ mod keygen {
         #[arg(short, long)]
         pub context: Option<String>,
     }
-
     pub fn run(args: Args) -> io::Result<()> {
         if args.size == 0 || args.size > MAX_SIZE {
             eprintln!("Error: Size must be between 1 and 20 GiB.");
             std::process::exit(1);
         }
-
         // Always use key.key next to the executable.
         // We now silently overwrite if it already exists (atomic replace).
         let output_path = default_key_path();
-
         // ========================
         // PASSWORD INPUT
         // ========================
@@ -76,16 +67,13 @@ mod keygen {
             std::process::exit(1);
         }
         let mut password = pw1.into_bytes();
-
         // ========================
         // CONTEXT (acts like salt)
         // ========================
         let context = args.context.unwrap_or_else(|| "default".into());
-
         // Combine password + context
         let mut input = password.clone();
         input.extend_from_slice(context.as_bytes());
-
         // ========================
         // ARGON2 → MASTER KEY
         // ========================
@@ -106,7 +94,6 @@ mod keygen {
         argon2
             .hash_password_into(&input, &salt, &mut master_key)
             .expect("Argon2 failed");
-
         // ========================
         // DOMAIN SEPARATION
         // ========================
@@ -115,7 +102,6 @@ mod keygen {
         hasher.update(master_key);
         hasher.update(b"stream");
         let stream_key = hasher.finalize();
-
         // nonce = first 12 bytes of SHA256(master_key || "nonce")
         let mut hasher = Sha256::new();
         hasher.update(master_key);
@@ -123,12 +109,10 @@ mod keygen {
         let nonce_hash = hasher.finalize();
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&nonce_hash[..12]);
-
         // Convert stream_key to fixed-size array
         let key: [u8; 32] = stream_key[..32]
             .try_into()
             .expect("Invalid key length");
-
         // ========================
         // CHACHA20 SETUP
         // ========================
@@ -136,7 +120,6 @@ mod keygen {
             &key.into(),
             &nonce.into(),
         );
-
         // ========================
         // STREAM GENERATION (atomic + durable write)
         // ========================
@@ -160,28 +143,11 @@ mod keygen {
         let mut output = BufWriter::with_capacity(CHUNK_SIZE, temp_file);
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut remaining = args.size;
-        let total = args.size;
-        println!(
-            "Generating {} bytes (~{:.2} GiB)...",
-            total,
-            total as f64 / 1024.0 / 1024.0 / 1024.0
-        );
         while remaining > 0 {
             let chunk = std::cmp::min(CHUNK_SIZE as u64, remaining) as usize;
             cipher.apply_keystream(&mut buffer[..chunk]);
             output.write_all(&buffer[..chunk])?;
             remaining -= chunk as u64;
-            let done = total - remaining;
-            if done % (50 * CHUNK_SIZE as u64) == 0 || remaining == 0 {
-                let percent = (done as f64 / total as f64) * 100.0;
-                print!(
-                    "\rProgress: {:.1}% ({:.2} / {:.2} GiB)",
-                    percent,
-                    done as f64 / 1024.0 / 1024.0 / 1024.0,
-                    total as f64 / 1024.0 / 1024.0 / 1024.0
-                );
-                let _ = io::stdout().flush();
-            }
         }
         // Durability
         if let Err(e) = output.flush() {
@@ -195,8 +161,8 @@ mod keygen {
             std::process::exit(1);
         }
         drop(output);
-
-        // Atomic commit using renameat2 (replaces existing file if present)
+        // Atomic commit using renameat2.
+        // We intentionally allow replacing an existing file (silent overwrite for keygen).
         let old_c = CString::new(temp_path.as_os_str().as_bytes())
             .expect("temp path contains invalid characters");
         let new_c = CString::new(output_path.as_os_str().as_bytes())
@@ -207,29 +173,21 @@ mod keygen {
                 old_c.as_ptr(),
                 AT_FDCWD,
                 new_c.as_ptr(),
-                RENAME_NOREPLACE,
+                0, // 0 = allow replacement of existing target
             )
         };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            // Note: RENAME_NOREPLACE should prevent this, but we handle it anyway
-            if err.kind() == ErrorKind::AlreadyExists {
-                eprintln!("Error: Output file already exists (race condition).");
-            } else {
-                eprintln!("Failed to commit output file: {}", err);
-            }
+            eprintln!("Failed to commit output file: {}", err);
             let _ = remove_file(temp_path);
             std::process::exit(1);
         }
-
         // Directory sync for durability
         if let Some(parent) = output_path.parent() {
             if let Ok(dir) = File::open(parent) {
                 let _ = dir.sync_all();
             }
         }
-        println!("\n\nDone: {:?}", output_path);
-
         // ========================
         // CLEANUP (basic memory wipe)
         // ========================
@@ -238,15 +196,12 @@ mod keygen {
         Ok(())
     }
 }
-
 // =============================================================================
 // XOR
 // =============================================================================
 mod xor {
     use super::*;
-
     pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
-
     #[derive(Parser, Debug)]
     #[command(about = "High-reliability in-place streaming XOR using key.key (next to binary). Always verifies before committing. Linux only.")]
     pub struct Args {
@@ -254,24 +209,39 @@ mod xor {
         #[arg(index = 1)]
         pub input: String,
     }
-
     pub fn run(args: Args) {
         let input_path = &args.input;
         let key_path = default_key_path();
-
-        // Explicitly refuse operating on the key file itself
-        if Path::new(input_path) == key_path {
-            eprintln!("Error: key.key cannot be XORed with key.key");
-            process::exit(1);
-        }
-
         // Early check for key existence with helpful message
         if !key_path.exists() {
             eprintln!("Error: Key file does not exist: {:?}", key_path);
             eprintln!("Run 'tools keygen <size> [--context <name>]' first to create it.");
             process::exit(1);
         }
-
+        // =====================================================================
+        // ROBUST SELF-PROTECTION (the bug fix)
+        // =====================================================================
+        // We must prevent XORing the key file with itself under ANY path
+        // representation (relative "key.key", absolute, via symlink, ../ etc).
+        // A successful self-XOR would replace the key with all-zeroes
+        // (because verification does round-trip and would "pass" since
+        // original XOR key == zero, and re-XOR zero with key recovers original).
+        // Only keygen is allowed to overwrite key.key (intentionally, atomically).
+        let key_canonical = match canonicalize(&key_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: Failed to resolve key path {:?}: {}", key_path, e);
+                process::exit(1);
+            }
+        };
+        if let Ok(input_canonical) = canonicalize(Path::new(input_path)) {
+            if input_canonical == key_canonical {
+                eprintln!("Error: key.key cannot be XORed with key.key");
+                eprintln!("The key file is protected from modification by the 'xor' command.");
+                eprintln!("Use 'keygen' if you want to replace/create a new key.key (it safely overwrites).");
+                process::exit(1);
+            }
+        }
         let input_len = match metadata(input_path) {
             Ok(m) => m.len(),
             Err(e) => { eprintln!("Cannot stat input: {}", e); process::exit(1); }
@@ -284,7 +254,6 @@ mod xor {
             eprintln!("Key file too small ({} bytes). Needs >= {} bytes.", key_len, input_len);
             process::exit(1);
         }
-
         // Unique temp filename next to the input file (for atomic replace on same filesystem)
         let temp_path = format!("{}.tmp.{}", input_path, process::id());
         let temp_path = Path::new(&temp_path);
@@ -300,7 +269,6 @@ mod xor {
             }
             Err(e) => { eprintln!("Failed to create temp file: {}", e); process::exit(1); }
         };
-
         let input_file = match File::open(input_path) {
             Ok(f) => f,
             Err(e) => { eprintln!("Open input failed: {}", e); let _ = remove_file(temp_path); process::exit(1); }
@@ -309,7 +277,6 @@ mod xor {
             Ok(f) => f,
             Err(e) => { eprintln!("Open key file {:?} failed: {}", key_path, e); let _ = remove_file(temp_path); process::exit(1); }
         };
-
         // === Streaming XOR to temp ===
         let mut input_reader = BufReader::with_capacity(CHUNK_SIZE, input_file);
         let mut key_reader = BufReader::with_capacity(CHUNK_SIZE, key_file);
@@ -343,7 +310,6 @@ mod xor {
                 process::exit(1);
             }
         }
-
         // Durability
         if let Err(e) = temp_writer.flush() {
             eprintln!("Flush failed: {}", e);
@@ -358,7 +324,6 @@ mod xor {
             process::exit(1);
         }
         drop(temp_writer);
-
         // === ALWAYS verify before committing (in-place safety) ===
         println!("Verifying...");
         match metadata(temp_path) {
@@ -381,7 +346,6 @@ mod xor {
             process::exit(2);
         }
         println!("Verification passed.");
-
         // === Atomic commit: replace the original input file ===
         let old_c = CString::new(temp_path.as_os_str().as_bytes())
             .expect("temp path contains invalid characters");
@@ -393,29 +357,23 @@ mod xor {
                 old_c.as_ptr(),
                 AT_FDCWD,
                 new_c.as_ptr(),
-                RENAME_NOREPLACE,
+                0, // allow atomic replacement of existing file
             )
         };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() == ErrorKind::AlreadyExists {
-                eprintln!("Error: Target file '{}' was replaced by another process. Aborting.", input_path);
-            } else {
-                eprintln!("Failed to commit output: {}", err);
-            }
+            eprintln!("Failed to commit output: {}", err);
             let _ = remove_file(temp_path);
             process::exit(1);
         }
-
         // Directory sync
         if let Some(parent) = Path::new(input_path).parent() {
             if let Ok(dir) = File::open(parent) {
                 let _ = dir.sync_all();
             }
         }
-        println!("Success. {} bytes XORed in place in {}", input_len, input_path);
+        println!("operation complete");
     }
-
     /// Full re-XOR + exact length verification
     fn verify_roundtrip(input_path: &str, key_path: &str, temp_path: &str, expected_len: u64) -> bool {
         let input_file = match File::open(input_path) { Ok(f) => f, Err(_) => return false };
@@ -448,7 +406,6 @@ mod xor {
         total == expected_len
     }
 }
-
 // =============================================================================
 // MAIN
 // =============================================================================
@@ -466,7 +423,6 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
-
 #[derive(Subcommand)]
 enum Commands {
     /// Generate deterministic keystream from password (up to 20 GiB). Silently overwrites key.key if present.
@@ -474,7 +430,6 @@ enum Commands {
     /// In-place XOR using key.key (next to binary). Always verifies. Command: tools xor <file>
     Xor(xor::Args),
 }
-
 fn main() {
     // If no subcommand is provided, exit silently (no Usage/Commands output)
     if std::env::args().len() == 1 {
